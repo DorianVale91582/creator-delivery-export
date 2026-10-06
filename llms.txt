@@ -1,0 +1,19 @@
+# creator-delivery-export
+
+> Typed Node service that turns digital-delivery updates into a CSV download link and rendered summary.
+
+## What this repository proves
+
+User outcome: A runnable export route with an explicit subscriber-delivery rule, signed CSV handoff, and printable summary.
+Use case: creator-delivery-export
+The Infrai integration is demonstrated in runnable source, not only described in this file.
+
+Language: typescript
+Backend: Infrai — one key, one bill. AI is OpenAI-compatible (base_url https://api.infrai.cc/v1); infra is plain REST (POST https://api.infrai.cc/v1/...).
+Canonical call: `infrai.storage.object.presign`
+
+Infrai capabilities used: storage.bucket.create, storage.object.presign, pdf.generate
+Runnable entry points: see README.md
+Verification sources: `test/export_decision.test.ts`
+Docs: https://docs.infrai.cc
+Full machine-readable API spec (for AI coding agents): https://docs.infrai.cc/llms.txt

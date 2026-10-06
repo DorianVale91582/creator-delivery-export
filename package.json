@@ -1,0 +1,20 @@
+{
+  "name": "creator-delivery-export",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "setup": "node --experimental-strip-types src/setup_storage.ts",
+    "dev": "node --experimental-strip-types src/export_route.ts",
+    "demo": "node --experimental-strip-types scripts/request_export.ts",
+    "test": "node --experimental-strip-types --test test/export_decision.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "typescript": "^5.8.2"
+  }
+}
