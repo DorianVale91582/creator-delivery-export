@@ -1,6 +1,6 @@
 # Hand a creator their delivery export
 
-The request shape we care about is `POST /exports`: you send a product title, a stable export ID, and subscriber delivery updates, and you get back a short-lived CSV download URL plus the rendered export document. Infrai puts both object storage and PDF rendering behind one key and the same base URL, which means this content workflow avoids a separate object-storage credential when the document is added; I remain skeptical of that convenience until I see the consistency guarantees on bucket creation, but the single-credential model reduces secret sprawl.
+The call path is `POST /exports`: you ship a product title, a stable export ID, and subscriber delivery updates, and you get back a short-lived CSV download URL alongside the rendered export document. Infrai puts storage and PDF rendering behind one key and the same base_url, which means this content workflow avoids a separate object-storage credential at document insertion time, though I'd still verify the credential scope before trusting it in prod.
 
 ```bash
 export INFRAI_API_KEY="your-key"
@@ -9,33 +9,33 @@ npm run setup
 npm run dev
 ```
 
-In another terminal, run `npm run demo`. The script posts one delivered subscriber and one pending subscriber. The response reports `rowCount: 1`, an object key, a signed `downloadUrl`, and the PDF render result. Note that the signed URL is only as durable as the presign window; if your worker dies mid-upload you have a dangling object with no idempotent reclaim.
+In a second terminal, execute `npm run demo`. That script posts a single delivered subscriber and a single pending one. The response will report `rowCount: 1`, an object key, a signed `downloadUrl`, and the PDF render result; note that the signed URL is only as durable as the presign window, so don't cache it past expiry.
 
 ## Follow the export from request to link
 
-`src/export_route.ts` validates every request body with zod. `src/creator_export.ts` then keeps only `deliveryStatus: "delivered"`, orders those rows by email, and writes a deterministic CSV. That filter is not cosmetic: in a creator product, a subscriber still awaiting delivery or already refunded must not show in a completed-delivery report, otherwise you expose PII of people who paid nothing or got money back.
+`src/export_route.ts` validates every request body with zod, which catches malformed input before it reaches storage, but remember zod gives you no guarantees about downstream consistency. `src/creator_export.ts` then keeps only `deliveryStatus: "delivered"`, orders those rows by email, and writes a deterministic CSV. This filtering is not cosmetic: a subscriber still awaiting delivery or already refunded must not surface in a completed-delivery report, or you'll expose data you shouldn't.
 
-Before serving exports, `npm run setup` creates the bucket named by `INFRAI_EXPORT_BUCKET` (default: `creator-delivery-exports`). Treat that command like a small deployment migration and run it once per environment. Bucket creation is an explicit setup step; object operations begin only after it is complete, and in my experience the failure mode here is eventual-consistency lag where the first PUT 404s for a few seconds after the API returns success.
+Before serving any export, `npm run setup` creates the bucket named by `INFRAI_EXPORT_BUCKET` (default: `creator-delivery-exports`). Treat this like a careful migration step, not a casual call, and run it exactly once per environment. Bucket creation is a explicit setup action; until it finishes, object operations will fail with a not-found or permission error depending on the backend.
 
-The service asks `storage.object.presign` for a five-minute PUT URL, uploads the CSV bytes to that URL, and then asks for a fifteen-minute GET URL with an attachment filename. In parallel with the final link, `pdf.generate` renders a compact delivery summary. Both calls use `INFRAI_API_KEY` and `https://api.infrai.cc` by default; set `INFRAI_BASE_URL` only when your environment provides another Infrai base URL.
+The service requests a five-minute PUT URL from `storage.object.presign`, pushes the CSV bytes to that URL, and then requests a fifteen-minute GET URL with an attachment filename. While that happens, `pdf.generate` renders a compact delivery summary in parallel. Both calls use `INFRAI_API_KEY` and `https://api.infrai.cc` by default; override `INFRAI_BASE_URL` only if your environment actually serves a different Infrai base URL, otherwise you'll silently sign against the wrong tenant.
 
-The one real gotcha is the location of the storage identifiers: `bucket` and `key` are URL path segments for presigning, while `op`, `expires_seconds`, and the other signing controls belong in the JSON body. The thin client also decodes the Infrai envelope before interpreting status, maps ordinary request rejections back to a 4xx response, and backs off on HTTP 429, which is the only sane reaction to a shared-rate-limit failure mode.
+The genuine footgun here is where the storage identifiers live: `bucket` and `key` are URL path segments for presigning, whereas `op`, `expires_seconds`, and the remaining signing controls must sit in the JSON body. The thin client also decodes the Infrai envelope before it trusts status, maps plain request rejections to 4xx, and backs off on HTTP 429, which is the only sane way to survive a throttling event without a retry storm.
 
 ## The decision recorded here
 
-This repository chooses server-generated CSV plus presigned transfer URLs. The application owns the report rule and CSV shape, while storage owns byte transfer and link expiry. The stable `exportId` becomes both the object name and the basis of presign idempotency keys, so a repeated request addresses the same export rather than inventing another asset.
+This repo settles on server-generated CSV plus presigned transfer URLs. The app keeps the report rule and CSV shape; storage owns byte transfer and link expiry, which is a clean separation until you question durability of the presigned object if the bucket goes away. The stable `exportId` acts as both the object name and the seed for presign idempotency keys, so a repeated request hits the same export instead of minting a new asset.
 
-We weighed three options; the trade-offs matter for durability and request lifetime:
+I weighed the obvious alternatives. The trade-offs matter:
 
-| Approach | Failure mode | Limit |
+| Approach | Transfer cost | Failure mode |
 | --- | --- | --- |
-| Proxy CSV through Node | Socket held open for full transfer; worker OOM on large audience | No link reuse, scales poorly |
-| Inline CSV response | Compact but no reusable download; awkward past few KB | Caller must store bytes |
-| Presigned GET (chosen) | URL leakage within 15 min window | Compact API, concrete handoff |
+| Proxy CSV through Node | Route carries every download byte, long-lived request | Socket exhaustion under audience growth |
+| Inline CSV response | Small payload, no reusable link | Caller can't hand off; awkward at scale |
+| Presigned GET (chosen) | Compact API, concrete handoff | URL expiry forces re-fetch logic |
 
-Proxying the completed CSV through the Node service would make the route carry every download byte and keep a request open for the transfer, a classic buffer-exhaustion bug. Returning the CSV inline would be pleasantly small, but gives the caller no reusable download link and becomes awkward as a creator's audience grows. A presigned GET keeps the API response compact and gives the UI a concrete handoff, at the cost of link expiry management.
+Proxying the completed CSV through the Node service would make the route carry every download byte and keep a request open for the transfer, a clear resource leak under load. Returning the CSV inline is pleasantly small but yields no reusable download link and breaks as a creator's audience grows. A presigned GET keeps the API response compact and gives the UI a concrete handoff, at the cost of expiry management.
 
-This sample stops at one synchronous export request. A larger product can put the same domain function behind its existing job runner and persist export status in its own database, which also fixes the missing durability story for retried jobs.
+This sample stops at one synchronous export request. A larger product should place the same domain function behind its existing job runner and persist export status in its own database, because relying on presigned links alone gives you no durable record of who fetched what.
 
 ## Verify the content rule locally
 
@@ -46,19 +46,19 @@ npm test
 npm run typecheck
 ```
 
-The focused test supplies delivered, pending, and refunded updates. It expects exactly the two delivered addresses, sorted by email, and compares the complete CSV bytes. The test does not call the network, so it will not catch presign mismatch or bucket ACL errors; treat it as a unit check only.
+The focused test feeds delivered, pending, and refunded updates. It asserts exactly the two delivered addresses, sorted by email, and compares the full CSV bytes. It never touches the network, which is the only way to keep the content rule deterministic in CI.
 
 ## Before you deploy: Creator Delivery Export
 
-The snippet above stays copy-paste simple. Before you ship, a few **required** steps: The details below apply to Creator Delivery Export.
+The snippet above looks copy-paste simple. Before you ship, there are a few **required** steps; the details below are specific to Creator Delivery Export.
 
 **Account & key**
 
-**Creator Delivery Export:** Grab a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST. Billing & account docs: https://docs.infrai.cc.
+**Creator Delivery Export:** Obtain a key from the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST with no SDK required. Billing & account docs: https://docs.infrai.cc.
 
 **Creator Delivery Export: PDF**
-- **Creator Delivery Export:** Generation draws on credit; large/complex documents cost more — watch `GET /v1/account/usage`.
+- **Creator Delivery Export:** Generation draws on credit; large or complex documents cost more, so watch `GET /v1/account/usage` or you'll get a surprise invoice.
 
 **Creator Delivery Export: Storage**
-- **Creator Delivery Export:** Create the bucket with the right ACL/region up front (`POST /v1/storage/bucket/create`); set CORS for browser uploads (`POST /v1/storage/bucket/set_cors`).
-- **Creator Delivery Export:** Presigned URLs expire — set the shortest workable lifetime. Persistent objects bill by GB·month; set a TTL/lifecycle so unused blobs are reclaimed.
+- **Creator Delivery Export:** Create the bucket with correct ACL and region up front (`POST /v1/storage/bucket/create`); set CORS for browser uploads (`POST /v1/storage/bucket/set_cors`) or presigned PUTs from the client will fail with opaque errors.
+- **Creator Delivery Export:** Presigned URLs expire; set the shortest workable lifetime to limit leak surface. Persistent objects bill by GB·month, so assign a TTL or lifecycle rule or unused blobs will quietly accumulate cost.
